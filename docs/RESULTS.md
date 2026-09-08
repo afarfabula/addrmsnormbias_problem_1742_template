@@ -282,6 +282,27 @@
   小行数下批量 Init 每-launch 固定开销，规划 rowsPerTile_ 按实际行数裁剪）、#5（3.15x）、
   #11/#13（超宽行 ~2.8x，v9 行级批量/γβ 跨行复用改造）。
 
+## v9a（本轮）— 批量 Init 按实际行数裁剪（微 case 固定开销）
+- 内容：`AddRmsNormBiasGroup::Init` 里 `rowsPerTile_` 由固定整 tile（fp16/bf16 D<=384
+  批量路径 D=64 -> 96 行）改为 `min(整tile行数, 本核实际 rowCount_)`：小行数 case 不再
+  每次 launch 都铺满整 tile 的 γ/β/rstd Gather 复制表（官方 v8 微 case 相对 v5 回退的
+  主要嫌疑来源）；同时把 shape 级测速脚本固化进仓库 `scripts/bench_shape.py`（避免依赖
+  易失 /tmp）。`.gitignore` 排除 `deps/`（1.7GB 官方教程仓库，不入库）。
+- 精度：`run_accuracy.py` 16/16；`run_heavy_accuracy.py` 13/13；超宽/宽行独立 8 组
+  （D=4096/8192/16384/32768 × fp16/fp32/bf16）全 PASS。
+- msprof op（task duration, launch=2, warm-up=1，微 case 单发）：
+  | shape | v8 | v9a | 变化 |
+  |--|--|--|--|
+  | `[1,64]` | 8.12µs | 7.96µs | -2% |
+  | `[16,64]` | 8.36µs | 7.80µs | -7% |
+  | `[256,64]` | 8.46µs | 7.86µs | -7% |
+  | `[2048,64]` | 8.46µs | 8.36µs | -1% |
+  - 注：微 case 单发被 launch floor(~8µs) 主导，官方口径差异需官方回贴校准。
+- 热循环回归（dev_avg_us, reps=300, 相对 v8）：`[2048,2048,64]` 4112→4103、
+  `[1024,32768]` 333→333、`[8192,96]` 21.7→21.9、`[8192,384]` 42.3→42.6、
+  `[4096,100]` 25.6→25.7——均 ≈（噪声内）。
+- 评测：待用户回贴（预期微 case 每-launch Init 成本下降；若 #1 未恢复，则#1 回退另有原因）。
+
 ## <next> — v9 规划：ultra 行级批量改造（消除 per-row 标量 GetValue、γ/β 跨行复用、
 - 窗口级 MTE2/V 事件同步、减少 pass1/pass2 barrier 数）+ 本地 testcase 形状扩充（含
 - 非 2 幂 D 与 D=16384/32768 大行列）
