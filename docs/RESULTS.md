@@ -570,3 +570,26 @@
 - 下一步候选：#1~#3 类做“超微路径”（本核数据量小于 1~2 tile 时走极简 Init：去掉 rep 表/
   双缓冲/冗余 DataCopy，尽量少 barrier 的单 tile 流程），把暖态 floor 从 3.2µs 压向 ~2µs；
   该路径可直接用 bench_multi 的 r1~r64 D64/D96 fp16/bf16/fp32 做本地回归。
+
+## v15（2026-09-10）— group1 空 block 跳过 γ/β+rep 表构建（微/中行数平台修复）
+- 背景：本地微 case sweep 发现 fp16/bf16 D64 rows 64~256 出现 ~7.0µs 平台（同形状 fp32 仅
+  3.6~4.0µs）。根因：host 固定启动 40 个 block，总行数不足 40×blockRows 时尾部 core 分到
+  rowCount=0 的空 block；但 Init 里 `rowsPerTile_` 裁剪带 `rowCount_>0 &&` 守卫，空 block 的
+  rowsPerTile_ 仍为整 tile（D64 -> 96 行），于是空 block 也要跑完整 γ/β 载入 + 96 行
+  repG/repB/off 表构建（96×3 = 288 个 PipeBarrier<PIPE_V>），空 block 反而成为 kernel 关键路径。
+- 改动（kernel.asc，仅 AddRmsNormBiasGroup::Init）：γ/β 整行载入+ToFp32+批量 rep 表构建整体
+  包进 `if (rowCount_ > 0 && !wide_)`；空 block 保留 InitBuffer（编译器/UB 分配前提）但不再做
+  任何设备侧 γ/β/rep 工作。其余代码路径不变。
+- 精度：run_accuracy 16/16、run_heavy_accuracy 13/13 全 PASS。
+- 本地热队列 dev_avg_us（v13 -> v15，bench_multi，500 次）：
+  | shape | v13 | v15 | 变化 |
+  |--|--|--|--|
+  | fp16 [64,64] | 7.09 | 3.85 | -46% |
+  | fp16 [128,64] | 7.04 | 4.04 | -43% |
+  | fp16 [256,64] | 7.09 | 4.28 | -40% |
+  | bf16 [64,64] | 7.06 | 3.83 | -46% |
+  | fp16 [64,96] | 6.95 | 4.68 | -33% |
+  | fp16 [64,128] | 4.85 | 3.96 | -18% |
+  | r1~r32 D64 与 r512+ D64 | ≈ | ≈ | ±5%（噪声） |
+- 备注：该 7µs 平台与官方 #1 的 6.3~6.9µs 同量级，若 #1 属 D64/D96 中行数 fp16/bf16，本修复
+  有望直接把 #1 拉到 ~4µs；group2(Pad) Init 存在同类空 block 开销（下一步同样处理）。
