@@ -593,3 +593,24 @@
   | r1~r32 D64 与 r512+ D64 | ≈ | ≈ | ±5%（噪声） |
 - 备注：该 7µs 平台与官方 #1 的 6.3~6.9µs 同量级，若 #1 属 D64/D96 中行数 fp16/bf16，本修复
   有望直接把 #1 拉到 ~4µs；group2(Pad) Init 存在同类空 block 开销（下一步同样处理）。
+
+## v16（2026-09-10）— 空 block 修复扩展到 group2(Pad)/group0 保底
+- 改动：group1(v15) 同款问题在 group2 更严重——Pad Init 对每个 block 无条件做 γ/β 补零
+  (Duplicate ×2) + LoadPadParam(DataCopyPad ×2) + ToFp32 + （fp16/bf16）rep 表构建
+  （rowPad=128 时 48 行 ×3 barrier）；空 block 也全做，成为关键路径。v13 实测 D100 group2
+  平台：fp16 r64/r128/r256 = 12.9/13.2/13.5µs（fp32 r64 也 13.5µs）。本次把这段整体包进
+  `if (rowCount_ > 0)`；group0 保底路径 Process 的参数缓存 LoadParamBuf 同样只在
+  rowCount_>0 时执行。空 block 均保留 InitBuffer（编译器/UB 分配前提）。
+- 精度：run_accuracy 16/16、run_heavy_accuracy 13/13 全 PASS。
+- 本地热队列 dev_avg_us（v13 -> v16，bench_multi，500 次）：
+  | shape | dtype | v13 | v16 | 变化 |
+  |--|--|--|--|--|
+  | [64,100] | fp16 | 12.86 | 4.48 | -65% |
+  | [128,100] | fp16 | 13.22 | 4.59 | -65% |
+  | [256,100] | fp16 | 13.52 | 5.53 | -59% |
+  | [64,100] | fp32 | 13.48 | 5.61 | -58% |
+  | [64,64] | fp16 | 7.09 | 3.85 | -46%（v15） |
+  | [128,64] | fp16 | 7.04 | 4.04 | -43%（v15） |
+- 含义：官方 #4~#8 若含 D=100 类非对齐中行数（几十~几百行），这类平台也会同步消失。
+  剩余本地“中行数仍有 ~2µs 固定成本”的主要来源从空 block Init 转为：40-block launch 本身 +
+  busy block 的单 tile 固定 Init/Process（下一步：host 只启动有行的 block + 超微路径）。
