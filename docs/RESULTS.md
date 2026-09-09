@@ -614,3 +614,20 @@
 - 含义：官方 #4~#8 若含 D=100 类非对齐中行数（几十~几百行），这类平台也会同步消失。
   剩余本地“中行数仍有 ~2µs 固定成本”的主要来源从空 block Init 转为：40-block launch 本身 +
   busy block 的单 tile 固定 Init/Process（下一步：host 只启动有行的 block + 超微路径）。
+
+## v17（2026-09-10）— host 只启动有行 block + 微 tile 改走逐行 ProcessTile
+- host tiling：block 数改为“先按核数定每核行数、再取上整”，保证每个 block 都有行，
+  从源头消除空 block（配合 v15/v16 的空 block Init 守卫，双保险）。
+- group1 路由：batch_（fp16/bf16 D<=384 的 rep/Gather 批量路径）新增 `rowCount_*D_<1536`
+  时不启用——微/中 tile（本核数据 <1536 元素）改走逐行 ProcessTile（无 rep 表 3×barrier/
+  行、无 Gather/整 tile FMA），每行一次 WholeReduceSum + 短向量 FMA。
+- 精度：run_accuracy 16/16、run_heavy_accuracy 13/13 全 PASS。
+- 本地热队列 dev_avg_us（bench_multi 500 次，同会话 A/B 主增益形状）：
+  | shape | 改前(v16) | v17 | 变化 |
+  |--|--|--|--|
+  | fp16 [64,128] | 3.96 | 3.50 | -12% |
+  | fp16 [64,256] | 4.01 | 3.43 | -14% |
+  | fp16 [64,192] | 4.86 | 4.48 | -8% |
+  | fp16 [64,64] | 3.85 | ~3.6 | -7% |
+  | fp16 [1,64]~[16,64] | 3.2~3.3 | 3.0~3.3 | ≈/噪声 |
+  | fp16 [512~1024,64] | 4.8~5.8 | ≈ | 批量路径保留 |
