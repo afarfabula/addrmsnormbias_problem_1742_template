@@ -14,6 +14,25 @@ endif()
 
 add_executable(add_rms_norm_bias_custom main.asc)
 add_executable(probe_multi probe_multi.asc)
+add_executable(bench_multi bench_multi.asc)
+
+target_link_libraries(bench_multi PRIVATE
+    tiling_api
+    register
+    platform
+    unified_dlog
+    dl
+    m
+    graph_base
+)
+
+target_include_directories(bench_multi PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+
+target_compile_options(bench_multi PRIVATE
+    $<$<COMPILE_LANGUAGE:ASC>:--npu-arch=${SOC_ARCH}>
+)
 
 target_link_libraries(probe_multi PRIVATE
     tiling_api
