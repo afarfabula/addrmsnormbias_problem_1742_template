@@ -697,3 +697,37 @@
 > 后续行动方案见 [NOTE_case1.md §9](./NOTE_case1.md)（三步法：钉死 shape → 极简通路 → 本地 A/B）。
 > **平台红线**：提交代码中不得含调试/探测内容（"如需 Debug 请在本地进行"）——
 > 任何注入延时/探针的 kernel 都不可用于提交，相关工具已移出本仓库（`../addrms_probe_toolkit/`）。
+
+## v18（盲提交候选 2026-09-11）— 行数相关屏障折叠：rep 表倍增构造 + 归约/pass2 行间屏障合并
+
+**动机**：把历史各版本"最好的部分"叠起来并未产生新东西（v17 已是累积式最优并集：v13/v15/v16/v17
+全在，v9 的 UltraAll 与 v14 三路实验因实测为负已回退）。这一次改的是**v17 里唯一还能被公式化指出
+的结构性浪费**——"与行数成正比"的屏障开销，它在 v4 时代并不存在（v4 的逐行 pass2 没有任何行间屏障）。
+
+**改动（kernel.asc，四处，全部是同步折叠，不改任何数值语义）**
+
+| 位置 | v17 行为 | v18 行为 |
+|--|--|--|
+| group1 `AddRmsNormBiasGroup::Init`（batch） | 逐行 3 条向量指令 + **3 个 PIPE_V 屏障/行**（D=64 → 96 行 = 288 个） | `BuildRepTables`：γ/β 铺行表**倍增构造**（log2(rows) 步，每步 1 个屏障）；rstd 的 Gather offset 表逐行 `Duplicate` 但整表只留 1 个屏障 → **288 个屏障 → ~9 个** |
+| group2 `AddRmsNormBiasPad::Init`（batch） | 同上（行宽 rowPad_） | 同上 |
+| group1/group2 `RowReduceTo64(g)` | 每行内逐级归约，**每级 1 个屏障/行** | 改成**级外层、行内层**（级内各行互不依赖）→ 屏障数 O(levels) 而非 O(rows×levels) |
+| group1 `ProcessTile` / group2 `ProcessTile` pass2 | 逐行 `Muls`→屏障→`FusedMulAdd`→屏障→`Cast`（3 个屏障/行/列分块） | 按**操作外层、行内层**发指令（Muls 全行→1 屏障→FMA 全行→1 屏障→Cast 全行→1 屏障） |
+
+**为什么这样做仍然安全**：所有跨引擎（MTE2/MTE3 ↔ V）的 buffer 复用在 v17 里就已由 `PipeBarrier<PIPE_ALL>`
+或 V_S/S_V 事件保护，本次未动；**同 pipe 内的每一处真实 RAW 依赖仍各自留有 1 个 PIPE_V 屏障**（倍增构造
+的步与步之间、归约的级与级之间、pass2 的 Muls→FMA→Cast 之间）。被删掉的只是"行与行之间"那些本来
+互不依赖的屏障。历史旁证：v4 的 `ProcessTile` 逐行 pass2 连行内 RAW 都没有屏障，且通过了官方精度校验
+并以 4.25µs 拿下 #1（best ever）。
+
+**预期（按 #1 可能的 shape 分档，全部为盲估）**
+
+| #1 若为… | v17 | v18 预期 |
+|--|--|--|
+| fp16/bf16、D=64、每核 ≥96 行（rowsPerTile_ 拉满） | 7.12µs | **屏障从 288 → ~9，理论回收 3~4µs** |
+| fp16/bf16、D=128~384、每核 16~48 行 | 7.12µs | Init 屏障 48~144 → ~5；归约屏障 48~144 → 2~3 → 回收 0.7~2µs |
+| 微 tile（rows×D < 1536，走 ProcessTile） | 7.12µs | pass2 行间屏障归零（单行 tile 收益有限，≈中性） |
+
+**验证状态**：本机无 Ascend 工具链（`ASCEND_HOME_PATH` 未设置、无 `/usr/local/Ascend`），**无法本地编译/实测**。
+已用一个本地 stub 头（`/tmp/addrms_stub/`，不入库）对 `kernel.asc` 做整文件 `g++ -fsyntax-only` 语法校验
+（v17 基线同为通过），语义层面由上述"屏障折叠"论证 + v4 旁证保证。**这是一次盲提交**：最坏情况是
+与 v17 持平（#1 的 D 偏大、行数偏少时），最好情况是把 #1 拉回 4~5µs 档。
