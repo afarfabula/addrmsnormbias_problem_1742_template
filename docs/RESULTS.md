@@ -791,3 +791,38 @@
      "fp32 单读 y-hold" 与 "UltraPadAll" 两条捷径），投入大、收益明确但周期长。
    - P2 **#5（3.37x）**：邻近区间已有人做到 5.39µs（我们是 18.19µs），属"已证明可解但我们差得远"，
      值得在 shape 反推后优先补。
+
+## v19（2026-09-11）— #1 固定成本手术：γ/β 往返并入第一个 tile + 去掉冗余 store drain
+
+**依据**：v18 已把"与行数成正比"的工作全部收掉（rep 表倍增、归约级外层、pass2 操作外层），
+而 #1 一动没动（7.12→7.05µs）——结合 v9a（对它有效）与 v18（对它无效）的唯一交集，判定 #1 的
+~7µs 是**每核固定开销**：几段串行 GM 往返 + 全 drain。本版就只动这条链，不碰任何行相关逻辑。
+group1 改动三处（group2/group3/group0 不动，避免扩大影响面）：
+
+| 位置 | v18 行为 | v19 行为 |
+|--|--|--|
+| `AddRmsNormBiasGroup::Init`（`!wide_`） | `PIPE_ALL` → DataCopy γ,β → `PIPE_ALL` → cast →（batch）rep 表；第一个 tile 再 `PIPE_ALL` → DataCopy x,r → `PIPE_ALL` ⇒ **两段 GM 往返完全串行** | 四路 DataCopy（γ,β,x,r 的第一个 tile）背靠背发出 → **一次 `MTE2→V` 等待** → cast + rep 表；第一个 tile 标 `prefetched` 跳过自己的搬运 ⇒ 省掉一整段暴露的 GM 延迟 |
+| `ProcessTileBatch` / `ProcessTile` | 每 tile 恒定 `PIPE_ALL` ×2 + 载入 | `prefetched` 时跳过载入与等待；后续 tile 保持原路径（多 tile 时该开销本就被摊薄） |
+| `ProcessTileBatch` 尾部 / `StageAndStore` | 输出 DataCopy 后再 `PIPE_ALL`（等 store 落地） | 输出前用精确事件 `V→MTE3`；**去掉尾部 drain**（og_/wk_ 的跨 tile 复用已由下一 tile 顶部的 `PIPE_ALL` 保护；kernel 以未完成的 MTE3 结尾是 AscendC 常规写法） |
+
+同时把 `MTE2→V`、`V→MTE3` 从全 drain 改成精确事件（`SyncMte2ToV` / `SyncVToMte3`）。
+
+**预期**：单 tile case（#1 家族）少一段串行 GM 往返 + 一次 store drain ⇒ 7.05µs 量级 → 4.5~5.5µs 量级；
+多 tile case（#14 等）只受益于尾部 drain 的移除，约 -1%。**风险**：本机无工具链，`HardEvent::MTE2_V` /
+`V_MTE3` 两个枚举名未经真实头文件编译验证 ⇒ **必须先在有 NPU 的机器上 `run.sh`（编译 + 精度）**。
+
+### v19 本地验证/取舍流程（提交前跑完）
+
+```bash
+# 1) 编译 + 精度（也顺便验证 MTE2_V / V_MTE3 两个枚举名）
+cd ~/addrmsnormbias_problem_1742_template && ./run.sh          # 期望 PASSED
+
+# 2) #1 家族形状的 A/B：先 checkout v18 二进制，再切回 v19，交替跑同一组 shape
+#    候选：#1 = fp16/bf16 小 D（D=64/96/128/192）× 行数扫描
+cd build && python3 ../scripts/gen_data.py  # 生成 case 目录的主流程见 bench_multi.asc 用法
+ASCEND_VISIBLE_DEVICES=2 ARNBS_TIMES=500 ./bench_multi <case_root…>
+```
+
+判定：**只看比值**（同一会话内新旧二进制交错）。若 D=64 行数 512/1024/2048 与 D=96 行数 64/128/256
+这几档 v19 ≤ v18（或更好），且 r1~r32 微档与 D≥384 档没有回退，就提交；若某档回退，把对应子改动单独回退
+（尾部 drain 与 Init 合并是两处独立改动，可分别回退验证）。
